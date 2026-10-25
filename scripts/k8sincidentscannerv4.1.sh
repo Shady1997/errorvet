@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Kubernetes Incident Diagnostic Scanner v5.5
+# Kubernetes Incident Diagnostic Scanner v5.7
 #
 # READ-ONLY / NON-MUTATING KUBERNETES RESOURCE SCANNER.
 # (Not "zero side effects": see the kubectl exec note below.)
@@ -67,6 +67,13 @@
 # v5.5: FAILURE CHAINS + FIX PLAN. Findings are linked to an earlier finding that can explain them; the SUGGESTED FIX
 # column gives commands (restart pod, rollback, raise limit, ...) only for the first resource of each chain. They are
 # printed, never executed: the read-only guard stays on. Table headers are bold.
+#
+# v5.6: terminating endpoints/pods are a rollout, not a fault; platform namespaces are owned by Infra with a k3s Helm-job
+# specific cause and fix; MASK_PII=1 masks long numbers in report views (credentials are always masked).
+#
+# v5.7: BULK PRELOAD -- pods, workloads, Services, EndpointSlices, ingresses and network policies are each read ONCE for
+# the whole scope and sliced locally (v5.6 repeated those reads per namespace, Service and pod). Old per-item reads stay
+# as fallbacks.
 #
 # It requires NO public internet access -- only connectivity to your
 # Kubernetes API server via the existing kubeconfig, and writes report
@@ -183,7 +190,7 @@ if [ "$FIRST_RUN" = "1" ]; then
 fi
 
 echo "============================================================"
-echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v5.5"
+echo " KUBERNETES INCIDENT DIAGNOSTIC SCANNER v5.7"
 echo "============================================================"
 echo ""
 
@@ -785,7 +792,8 @@ progress_pods() {
 # debugging); only the aggregated report views are redacted.
 # Set REDACT_SECRETS=0 to disable.
 REDACT_SECRETS="${REDACT_SECRETS:-1}"
-redact() {
+MASK_PII="${MASK_PII:-0}"   # 1 = also mask any run of 9+ digits (national IDs, card numbers) in report views; the ID you searched for stays visible
+redact_creds() {
     if [ "$REDACT_SECRETS" = "0" ]; then
         cat
         return
@@ -798,6 +806,30 @@ redact() {
         -e 's/(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/[REDACTED_JWT]/g' \
         -e 's#(://[A-Za-z0-9._-]+:)[^@/[:space:]]+(@)#\1[REDACTED]\2#g' \
         2>/dev/null
+}
+
+# v5.6: credentials are always masked; long digit runs only with MASK_PII=1
+redact() { redact_creds | mask_pii; }
+mask_pii() {
+    if [ "$MASK_PII" != "1" ]; then cat; return; fi
+    HL_KEEP="$SEARCH_VALUE" awk '
+        function stars(n,   s) { s = ""; while (n-- > 0) s = s "*"; return s }
+        function mask(s,   out, run, L) {
+            out = ""
+            while (match(s, /[0-9]+/)) {
+                run = substr(s, RSTART, RLENGTH); L = RLENGTH
+                out = out substr(s, 1, RSTART - 1) ((L >= 9) ? substr(run, 1, 2) stars(L - 4) substr(run, L - 1) : run)
+                s = substr(s, RSTART + RLENGTH)
+            }
+            return out s
+        }
+        {
+            keep = ENVIRON["HL_KEEP"]; line = $0; out = ""
+            if (keep != "" && index(line, keep) > 0) {
+                while ((p = index(line, keep)) > 0) { out = out mask(substr(line, 1, p - 1)) keep; line = substr(line, p + length(keep)) }
+                print out mask(line)
+            } else print mask(line)
+        }'
 }
 
 # Extract full multi-line exception/stack-trace blocks from a
@@ -1234,6 +1266,54 @@ fi
 # 2. NODES
 ###############################################################################
 
+# =============================================================================================================
+# v5.7 BULK PRELOAD: every kind of object is read ONCE for the whole scope (-A, or -n <selected namespace>) and
+# sliced locally. v5.6 repeated these reads for every namespace, every Service and every pod; the old per-item
+# reads remain only as fallbacks (a pod/Service that is missing from the bulk read is read individually).
+# =============================================================================================================
+POD_JP_BODY='{.status.phase}{"\n"}{.status.podIP}{"\n"}{.spec.nodeName}{"\n"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{range .status.conditions[?(@.type=="Ready")]}{.lastTransitionTime}{end}{"\n"}{.metadata.ownerReferences[0].kind}{"\n"}{.metadata.ownerReferences[0].name}{"\n"}{.spec.containers[*].readinessProbe.periodSeconds}{"\n"}{range .spec.containers[*]}{.resources.requests.cpu}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.limits.cpu}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.requests.memory}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.limits.memory}{" "}{end}{"\n"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{.metadata.deletionTimestamp}{"\n"}{"@@C\n"}{range .spec.containers[*]}{.name}{"\n"}{.image}{"\n"}{.ports[*].containerPort}{"\n"}{end}{"@@S\n"}{range .status.containerStatuses[*]}{.name}{"\n"}{.restartCount}{"\n"}{.state}{"\n"}{.lastState}{"\n"}{.lastState.terminated.exitCode}{"\n"}{.lastState.terminated.reason}{"\n"}{.lastState.terminated.finishedAt}{"\n"}{end}'
+BULK_DIR="$REPORT_DIR/data/bulk"; mkdir -p "$BULK_DIR/pods" "$BULK_DIR/eps"
+BULK_SCOPE="-A"; [ -n "$SELECTED_NS" ] && BULK_SCOPE="-n $SELECTED_NS"
+TPL_DEPLOY='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}'
+TPL_STS='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}'
+TPL_HPA='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.currentReplicas}{"\t"}{.spec.minReplicas}{"\t"}{.spec.maxReplicas}{"\t"}{.spec.scaleTargetRef.name}{"\t"}{range .status.conditions[?(@.type=="ScalingActive")]}{.status}{end}{"\n"}{end}'
+TPL_JOBS='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.status.failed}{"\n"}{end}'
+TPL_CRONJOBS='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.suspend}{"\t"}{.status.lastScheduleTime}{"\t"}{.status.lastSuccessfulTime}{"\n"}{end}'
+TPL_SVC='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.spec.clusterIP}{"\t"}{.spec.ports[*].port}{"\t"}{.spec.selector}{"\n"}{end}'
+# bulk_read KIND TEMPLATE-VAR FILE : one read for the whole scope; FILE.ok marks that the read SUCCEEDED (an empty file then means "none exist")
+bulk_read() { if kubectl get "$1" $BULK_SCOPE -o jsonpath="${!2}" > "$3" 2>/dev/null; then : > "$3.ok"; fi; }
+# nsrows FILE KIND TEMPLATE-VAR : this namespace's rows (without the namespace column); if the bulk read failed, read just this namespace instead
+nsrows() {
+    if [ -f "$1.ok" ]; then
+        awk -F'\t' -v ns="$NS" '$1 == ns { sub(/^[^\t]*\t/, ""); print }' "$1" 2>/dev/null
+    else
+        kubectl get "$2" -n "$NS" -o jsonpath="${!3}" 2>/dev/null | awk -F'\t' -v ns="$NS" '$1 == ns { sub(/^[^\t]*\t/, ""); print }'
+    fi | dash_tsv
+}
+
+POD_JP_BULK='{range .items[*]}{"@@P "}{.metadata.namespace}{" "}{.metadata.name}{"\n"}'"$POD_JP_BODY"'{"@@END\n"}{end}'
+kubectl get pods $BULK_SCOPE -o jsonpath="$POD_JP_BULK" 2>/dev/null > "$BULK_DIR/pods.txt"
+POD_BULK_OK=0
+if [ -s "$BULK_DIR/pods.txt" ]; then
+    POD_BULK_OK=1
+    awk -v dir="$BULK_DIR/pods" '
+        $1 == "@@P"   { out = dir "/" $2 "__" $3 ".txt"; printf "" >> out; next }
+        $1 == "@@END" { if (out != "") close(out); out = ""; next }
+        out != ""     { print >> out }' "$BULK_DIR/pods.txt"
+fi
+bulk_read deployment TPL_DEPLOY "$BULK_DIR/deploy.tsv"
+bulk_read statefulset TPL_STS "$BULK_DIR/sts.tsv"
+bulk_read hpa TPL_HPA "$BULK_DIR/hpa.tsv"
+bulk_read jobs TPL_JOBS "$BULK_DIR/jobs.tsv"
+bulk_read cronjobs TPL_CRONJOBS "$BULK_DIR/cronjobs.tsv"
+bulk_read svc TPL_SVC "$BULK_DIR/svc.tsv"
+kubectl get endpointslices $BULK_SCOPE -o jsonpath='{range .items[*]}{"@@S\t"}{.metadata.namespace}{"\t"}{.metadata.labels.kubernetes\.io/service-name}{"\n"}{range .endpoints[*]}{.addresses[0]}{"\t"}{.conditions.ready}{"\t"}{.targetRef.name}{"\t"}{.conditions.terminating}{"\n"}{end}{end}' 2>/dev/null > "$BULK_DIR/eps.txt"
+if [ -s "$BULK_DIR/eps.txt" ]; then
+    awk -F'\t' -v dir="$BULK_DIR/eps" '
+        $1 == "@@S" { if (out != "") close(out); out = dir "/" $2 "__" $3 ".txt"; printf "" >> out; next }
+        out != "" && NF { print >> out }' "$BULK_DIR/eps.txt"
+fi
+{ echo "Ingresses:"; kubectl get ingress $BULK_SCOPE -o wide 2>&1; echo "NetworkPolicies:"; kubectl get networkpolicy $BULK_SCOPE 2>&1; } >> "$REPORT"
 section "2. NODE HEALTH"
 
 kubectl get nodes -o wide > "$REPORT_DIR/data/nodes.txt" 2>&1
@@ -1252,7 +1332,11 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .st
 NODE_LIST=$(cut -f1 "$NODE_BULK")
 if [ "$NS_ONLY" = "1" ]; then
     # namespace-scoped: only check the node(s) that actually host pods of this namespace
-    NODE_LIST=$(kubectl get pods -n "$SELECTED_NS" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | awk 'NF' | sort -u)
+    if [ "$POD_BULK_OK" = "1" ]; then
+        NODE_LIST=$(awk '$1 == "@@P" { k = 0; next } { k++; if (k == 3 && $0 != "") print $0 }' "$BULK_DIR/pods.txt" | sort -u)
+    else
+        NODE_LIST=$(kubectl get pods -n "$SELECTED_NS" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | awk 'NF' | sort -u)
+    fi
     info "Node checks limited to the node(s) hosting pods of namespace $SELECTED_NS: $(echo $NODE_LIST)"
 fi
 
@@ -1305,7 +1389,12 @@ if [ "$NS_ONLY" = "1" ]; then
         kubectl get pods -A --field-selector spec.nodeName="$NODE" -o jsonpath="$REQ_JP" 2>/dev/null >> "$NODE_REQ_RAW"
     done
 else
-    kubectl get pods -A -o jsonpath="$REQ_JP" 2>/dev/null > "$NODE_REQ_RAW"
+    if [ "$POD_BULK_OK" = "1" ] && [ -z "$SELECTED_NS" ]; then
+        # whole cluster was already read: node name, CPU requests and memory requests are lines 3, 9 and 11 of each pod block
+        awk '$1 == "@@P" { k = 0; n = ""; c = ""; m = ""; next } $1 == "@@END" { print n "|" c "|" m; next } { k++; if (k == 3) n = $0; if (k == 9) c = $0; if (k == 11) m = $0 }' "$BULK_DIR/pods.txt" > "$NODE_REQ_RAW"
+    else
+        kubectl get pods -A -o jsonpath="$REQ_JP" 2>/dev/null > "$NODE_REQ_RAW"
+    fi
 fi
 NODE_REQ_TOT="$REPORT_DIR/data/node-requests-totals.tsv"
 awk -F'|' '
@@ -1517,7 +1606,7 @@ for NS in $NAMESPACE_LIST; do
             fi
             fix "kubectl describe deployment $D -n $NS"
         fi
-    done 3< <(kubectl get deployment -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null | dash_tsv)
+    done 3< <(nsrows "$BULK_DIR/deploy.tsv" deployment TPL_DEPLOY)
 
     # --- StatefulSets (important for Redis/Kafka/DB-style workloads) ---
     while IFS=$'\t' read -r -u 3 SS SS_DESIRED SS_READY; do
@@ -1535,7 +1624,7 @@ for NS in $NAMESPACE_LIST; do
             fix "kubectl describe statefulset $SS -n $NS"
             record_fact 55 STATEFULSET_NOT_READY "$NS" "$SS" "infra-or-developer" "StatefulSet $SS: $SS_READY/$SS_DESIRED replicas ready"
         fi
-    done 3< <(kubectl get statefulset -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null | dash_tsv)
+    done 3< <(nsrows "$BULK_DIR/sts.tsv" statefulset TPL_STS)
 
     if [ "$NS_WL_TOTAL" -gt 0 ] && [ "$NS_WL_DOWN" -eq "$NS_WL_TOTAL" ]; then
         critical "Namespace $NS: ALL $NS_WL_TOTAL workload(s) (Deployments/StatefulSets) have zero ready replicas -- complete namespace outage, not a partial degradation."
@@ -1557,7 +1646,7 @@ for NS in $NAMESPACE_LIST; do
             fix "kubectl top pods -n $NS -l app=$HPA_TARGET 2>/dev/null"
             record_fact 43 HPA_MAXED "$NS" "$HPA" "developer-or-infra" "HPA for $HPA_TARGET is maxed at $HPA_CUR/$HPA_MAX replicas -- likely under-provisioned for current load if traffic is still elevated"
         fi
-    done 3< <(kubectl get hpa -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.currentReplicas}{"\t"}{.spec.minReplicas}{"\t"}{.spec.maxReplicas}{"\t"}{.spec.scaleTargetRef.name}{"\t"}{range .status.conditions[?(@.type=="ScalingActive")]}{.status}{end}{"\n"}{end}' 2>/dev/null | dash_tsv)
+    done 3< <(nsrows "$BULK_DIR/hpa.tsv" hpa TPL_HPA)
 
     # --- Jobs: any Job with failed pod attempts ---
     while IFS=$'\t' read -r -u 3 J JOB_FAILED; do
@@ -1569,7 +1658,7 @@ for NS in $NAMESPACE_LIST; do
             fix "kubectl logs -n $NS -l job-name=$J --all-containers --tail=200"
             record_fact 55 JOB_FAILED "$NS" "$J" "developer" "Job $J: $JOB_FAILED failed attempt(s)"
         fi
-    done 3< <(kubectl get jobs -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.failed}{"\n"}{end}' 2>/dev/null | dash_tsv)
+    done 3< <(nsrows "$BULK_DIR/jobs.tsv" jobs TPL_JOBS)
 
     # --- CronJobs: last scheduled run without a matching successful completion (best-effort) ---
     while IFS=$'\t' read -r -u 3 CJ CJ_SUSPENDED CJ_LAST_SCHEDULE CJ_LAST_SUCCESS; do
@@ -1581,21 +1670,27 @@ for NS in $NAMESPACE_LIST; do
             fix "kubectl get jobs -n $NS | grep $CJ"
             record_fact 55 CRONJOB_UNCERTAIN "$NS" "$CJ" "developer" "Last scheduled=$CJ_LAST_SCHEDULE, last successful=${CJ_LAST_SUCCESS:-none} -- most recent run may have failed"
         fi
-    done 3< <(kubectl get cronjobs -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.suspend}{"\t"}{.status.lastScheduleTime}{"\t"}{.status.lastSuccessfulTime}{"\n"}{end}' 2>/dev/null | dash_tsv)
+    done 3< <(nsrows "$BULK_DIR/cronjobs.tsv" cronjobs TPL_CRONJOBS)
 
     echo "Services:" >> "$REPORT"
     # v5.4: ONE read for every Service (name, ClusterIP, ports, selector); v5.3 made ~5 calls per Service.
     SVC_BULK="$REPORT_DIR/data/svc-bulk-$NS.tsv"
-    kubectl get svc -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.clusterIP}{"\t"}{.spec.ports[*].port}{"\t"}{.spec.selector}{"\n"}{end}' 2>/dev/null | dash_tsv > "$SVC_BULK"
+    nsrows "$BULK_DIR/svc.tsv" svc TPL_SVC > "$SVC_BULK"
     { echo "  name / clusterIP / ports / selector:"; sed 's/^/  /' "$SVC_BULK"; } >> "$REPORT"
     while IFS=$'\t' read -r -u 3 SVC CLUSTER_IP SVC_PORT_LIST SVC_SEL_JSON; do
         [ -z "$SVC" ] && continue
         for _v in CLUSTER_IP SVC_PORT_LIST SVC_SEL_JSON; do [ "${!_v}" = "-" ] && printf -v "$_v" ''; done
 
-        SLICE_ROWS=$(kubectl get endpointslices -n "$NS" -l "kubernetes.io/service-name=$SVC" \
-            -o jsonpath='{range .items[*]}{range .endpoints[*]}{.addresses[0]}{"\t"}{.conditions.ready}{"\t"}{.targetRef.name}{"\n"}{end}{end}' 2>/dev/null)
+        TERM_LIST=""
+        EPS_KNOWN=0; EPS_FILE="$BULK_DIR/eps/${NS}__${SVC}.txt"
+        if [ -f "$EPS_FILE" ]; then
+            EPS_KNOWN=1; SLICE_ROWS=$(cat "$EPS_FILE")
+        else
+            SLICE_ROWS=$(kubectl get endpointslices -n "$NS" -l "kubernetes.io/service-name=$SVC" \
+                -o jsonpath='{range .items[*]}{range .endpoints[*]}{.addresses[0]}{"\t"}{.conditions.ready}{"\t"}{.targetRef.name}{"\t"}{.conditions.terminating}{"\n"}{end}{end}' 2>/dev/null)
+        fi
 
-        if [ -z "$SLICE_ROWS" ]; then
+        if [ -z "$SLICE_ROWS" ] && [ "$EPS_KNOWN" != "1" ]; then
             # Fallback: no EndpointSlice found (older cluster / CNI) -- use legacy Endpoints
             LEGACY_READY=$(kubectl get endpoints "$SVC" -n "$NS" -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
             LEGACY_NOTREADY=$(kubectl get endpoints "$SVC" -n "$NS" -o jsonpath='{.subsets[*].notReadyAddresses[*].ip}' 2>/dev/null)
@@ -1603,7 +1698,8 @@ for NS in $NAMESPACE_LIST; do
             NOTREADY_LIST="$LEGACY_NOTREADY"
         else
             READY_LIST=$(echo "$SLICE_ROWS" | awk -F'\t' '$2=="true"{ if ($3=="") printf "%s ", $1; else printf "%s(%s) ", $1, $3 }')
-            NOTREADY_LIST=$(echo "$SLICE_ROWS" | awk -F'\t' '$2!="true"{ if ($3=="") printf "%s ", $1; else printf "%s(%s) ", $1, $3 }')
+            NOTREADY_LIST=$(echo "$SLICE_ROWS" | awk -F'\t' '$2!="true" && $4!="true"{ if ($3=="") printf "%s ", $1; else printf "%s(%s) ", $1, $3 }')
+            TERM_LIST=$(echo "$SLICE_ROWS" | awk -F'\t' '$2!="true" && $4=="true"{ if ($3=="") printf "%s ", $1; else printf "%s(%s) ", $1, $3 }')
         fi
 
         # Optional active probe of every ready AND not-ready endpoint pod
@@ -1614,7 +1710,9 @@ for NS in $NAMESPACE_LIST; do
 
         echo "SERVICE $NS/$SVC  ClusterIP=$CLUSTER_IP  Ready=[$READY_LIST]  NotReady=[$NOTREADY_LIST]" >> "$REPORT"
 
-        if [ -z "$READY_LIST" ] && [ -z "$NOTREADY_LIST" ]; then
+        if [ -z "$READY_LIST" ] && [ -z "$NOTREADY_LIST" ] && [ -n "$TERM_LIST" ]; then
+            warn "Service $NS/$SVC has no ready endpoints right now: every backend is terminating ($TERM_LIST) -- a rollout or scale-down in progress; re-scan in a minute before treating it as an outage."
+        elif [ -z "$READY_LIST" ] && [ -z "$NOTREADY_LIST" ]; then
             # Explain WHY there are no endpoints: compare the Service's selector
             # with the pods that actually carry those labels (read-only gets).
             SVC_SELECTOR=$(echo "$SVC_SEL_JSON" | sed 's/[{}" ]//g; s/:/=/g')
@@ -1646,13 +1744,17 @@ for NS in $NAMESPACE_LIST; do
             info "Service $NS/$SVC ($CLUSTER_IP) all endpoints ready: $READY_LIST"
         fi
 
+        if [ -n "$TERM_LIST" ] && [ -n "$READY_LIST" ]; then
+            info "Service $NS/$SVC has terminating endpoint(s) -- rollout or scale-down in progress, not a fault: $TERM_LIST"
+        fi
+
         # `describe svc` only for Services with a problem (or DESCRIBE_ALL_SERVICES=1)
         if [ -z "$READY_LIST" ] || [ -n "$NOTREADY_LIST" ] || [ "${DESCRIBE_ALL_SERVICES:-0}" = "1" ]; then
             kubectl describe svc "$SVC" -n "$NS" >> "$REPORT" 2>&1
         fi
 
         # Save for the HTML "Service Topology" section
-        printf '%s\t%s\t%s\t%s\t%s\n' "$NS" "$SVC" "$CLUSTER_IP" "$READY_LIST" "$NOTREADY_LIST" >> "$REPORT_DIR/data/service-topology.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NS" "$SVC" "$CLUSTER_IP" "$READY_LIST" "$NOTREADY_LIST" "$TERM_LIST" >> "$REPORT_DIR/data/service-topology.tsv"
 
         SVC_CONFIRMED_REDIS=0
         echo "$SVC" | grep -Eqi '(^|-)redis(-|$)' && SVC_CONFIRMED_REDIS=1
@@ -1668,11 +1770,13 @@ for NS in $NAMESPACE_LIST; do
         fi
     done 3< "$SVC_BULK"
 
-    kubectl get ingress -n "$NS" -o wide >> "$REPORT" 2>&1
-    kubectl get networkpolicy -n "$NS" >> "$REPORT" 2>&1
 
     # --- Pods ---
-    POD_LIST=$(kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    if [ "$POD_BULK_OK" = "1" ]; then
+        POD_LIST=$(awk -v ns="$NS" '$1 == "@@P" && $2 == ns { print $3 }' "$BULK_DIR/pods.txt")
+    else
+        POD_LIST=$(kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    fi
     if [ "$SCOPE_MODE" = "NAMESPACE_SELECTED" ]; then
         ALLOWED_PODS=$(selected_pods_in_ns)
         POD_LIST=$(echo "$POD_LIST" | while read -r p; do
@@ -1690,10 +1794,14 @@ for NS in $NAMESPACE_LIST; do
         #  8-11 cpu/mem requests+limits (per container, space separated)  12 waiting reasons
         #  then "@@C" + 3 lines per container (name, image, ports) and "@@S" + 7 lines per container status
         #  (name, restarts, state, lastState, exitCode, reason, finishedAt).
-        mapfile -t PD < <(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.phase}{"\n"}{.status.podIP}{"\n"}{.spec.nodeName}{"\n"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{range .status.conditions[?(@.type=="Ready")]}{.lastTransitionTime}{end}{"\n"}{.metadata.ownerReferences[0].kind}{"\n"}{.metadata.ownerReferences[0].name}{"\n"}{.spec.containers[*].readinessProbe.periodSeconds}{"\n"}{range .spec.containers[*]}{.resources.requests.cpu}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.limits.cpu}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.requests.memory}{" "}{end}{"\n"}{range .spec.containers[*]}{.resources.limits.memory}{" "}{end}{"\n"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{end}{"\n"}{"@@C\n"}{range .spec.containers[*]}{.name}{"\n"}{.image}{"\n"}{.ports[*].containerPort}{"\n"}{end}{"@@S\n"}{range .status.containerStatuses[*]}{.name}{"\n"}{.restartCount}{"\n"}{.state}{"\n"}{.lastState}{"\n"}{.lastState.terminated.exitCode}{"\n"}{.lastState.terminated.reason}{"\n"}{.lastState.terminated.finishedAt}{"\n"}{end}' 2>/dev/null)
+        PD=()
+        if [ -s "$BULK_DIR/pods/${NS}__${POD}.txt" ]; then mapfile -t PD < "$BULK_DIR/pods/${NS}__${POD}.txt"; fi
+        if [ "${#PD[@]}" -eq 0 ]; then   # not in the bulk read (new pod, or bulk read failed): read it individually
+            mapfile -t PD < <(kubectl get pod "$POD" -n "$NS" -o jsonpath="$POD_JP_BODY" 2>/dev/null)
+        fi
         POD_STATUS="${PD[0]:-}"; POD_IP="${PD[1]:-}"; NODE_NAME="${PD[2]:-}"; READY_COND="${PD[3]:-}"
         HAS_READINESS_PROBE="${PD[7]:-}"
-        P_REQCPU="${PD[8]:-}"; P_LIMCPU="${PD[9]:-}"; P_REQMEM="${PD[10]:-}"; P_LIMMEM="${PD[11]:-}"; P_WAITREASONS="${PD[12]:-}"
+        P_REQCPU="${PD[8]:-}"; P_LIMCPU="${PD[9]:-}"; P_REQMEM="${PD[10]:-}"; P_LIMMEM="${PD[11]:-}"; P_WAITREASONS="${PD[12]:-}"; POD_TERMINATING="${PD[13]:-}"
         if [ -z "$POD_STATUS" ]; then
             POD_UNREAD=$((POD_UNREAD+1))
             info "Pod $NS/$POD could not be read (deleted since the list was taken, or API error) -- skipped."
@@ -1703,7 +1811,7 @@ for NS in $NAMESPACE_LIST; do
         POD_READY_TRANS["$NS/$POD"]="${PD[4]:-}"
         unset CS_IMAGE CS_PORTS CS_RESTARTS CS_STATE CS_LAST CS_EXIT CS_REASON CS_FIN
         declare -A CS_IMAGE CS_PORTS CS_RESTARTS CS_STATE CS_LAST CS_EXIT CS_REASON CS_FIN
-        CONTAINERS=""; _mode=""; _i=13
+        CONTAINERS=""; _mode=""; _i=14
         while [ "$_i" -lt "${#PD[@]}" ]; do
             case "${PD[$_i]}" in
                 "@@C") _mode=C; _i=$((_i+1)); continue ;;
@@ -1727,7 +1835,7 @@ for NS in $NAMESPACE_LIST; do
         # `describe pod` is heavy (pod + its events): only when something looks wrong, or DESCRIBE_ALL_PODS=1.
         POD_UNHEALTHY=0
         if [ "$POD_STATUS" != "Running" ] && [ "$POD_STATUS" != "Succeeded" ]; then POD_UNHEALTHY=1; fi
-        if [ "$POD_STATUS" = "Running" ] && [ "$READY_COND" != "True" ]; then POD_UNHEALTHY=1; fi
+        if [ "$POD_STATUS" = "Running" ] && [ "$READY_COND" != "True" ] && [ -z "$POD_TERMINATING" ]; then POD_UNHEALTHY=1; fi
         for _cn in "${!CS_RESTARTS[@]}"; do
             if [ "${CS_RESTARTS[$_cn]:-0}" -gt 0 ] 2>/dev/null; then POD_UNHEALTHY=1; fi
         done
@@ -1773,7 +1881,9 @@ for NS in $NAMESPACE_LIST; do
         esac
 
         # (READY_COND comes from the single pod read above)
-        if [ "$READY_COND" = "False" ] && [ "$POD_STATUS" = "Running" ]; then
+        if [ -n "$POD_TERMINATING" ]; then
+            info "Pod $NS/$POD is terminating (deletion requested $POD_TERMINATING) -- not treated as a readiness failure."
+        elif [ "$READY_COND" = "False" ] && [ "$POD_STATUS" = "Running" ]; then
             # Don't presume a readinessProbe exists and is "failing" -- a
             # Running-but-not-Ready pod is just as often a container that
             # hasn't finished starting, or one with NO readinessProbe at
@@ -2040,7 +2150,16 @@ fi
 # container image, since real deployments are often named "gateway",
 # "edge", "lb", "router", or use nginx/traefik/envoy under a custom name.
 # v5.4: ONE pod read feeds both the name-based and the image-based proxy detection (v5.3: two full pod lists).
-HA_RAW=$(kubectl get pods $HA_SCOPE_ARGS -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.containers[*]}{.image}{","}{end}{"\n"}{end}' 2>/dev/null)
+if [ "$POD_BULK_OK" = "1" ]; then
+    HA_RAW=$(awk '
+        $1 == "@@P"   { ns = $2; name = $3; mode = ""; idx = 0; imgs = ""; next }
+        $1 == "@@C"   { mode = "C"; idx = 0; next }
+        $1 == "@@S"   { mode = ""; next }
+        $1 == "@@END" { print ns " " name " " imgs; next }
+        mode == "C"   { idx++; if (idx % 3 == 2) imgs = imgs $0 "," }' "$BULK_DIR/pods.txt")
+else
+    HA_RAW=$(kubectl get pods $HA_SCOPE_ARGS -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.containers[*]}{.image}{","}{end}{"\n"}{end}' 2>/dev/null)
+fi
 HA_PODS_BY_NAME=$(echo "$HA_RAW" | awk 'NF {print $1" "$2}' | grep -Ei 'haproxy|ingress|nginx|traefik|envoy|gateway|controller|edge-proxy|(^|[^[:alnum:]_])lb([^[:alnum:]_]|$)|router' || true)
 HA_PODS_BY_IMAGE=$(echo "$HA_RAW" | grep -Ei 'haproxy|nginx|traefik|envoyproxy|/envoy|ingress-nginx' | awk '{print $1" "$2}' || true)
 
@@ -2616,7 +2735,9 @@ owner_short() {
 classify_log_cause() {
     local m
     m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-    if printf '%s' "$m" | grep -Eq 'x509|certificate|tls handshake|ssl handshake'; then
+    if printf '%s' "$m" | grep -Eq 'no repositories configured'; then
+        echo "Helm job could not find a chart repository -- typical of k3s' bundled Helm jobs that ran while the node/network was still starting; they normally retry and finish on their own."
+    elif printf '%s' "$m" | grep -Eq 'x509|certificate|tls handshake|ssl handshake'; then
         echo "TLS/certificate problem -- expired or untrusted certificate/CA, or hostname mismatch."
     elif printf '%s' "$m" | grep -Eq 'unauthorized|forbidden|permission denied|access denied|authentication fail|token (expired|invalid)|invalid token|noauth'; then
         echo "Authentication/authorization failure -- wrong or expired credentials/token, or missing RBAC / ServiceAccount permissions."
@@ -2774,6 +2895,10 @@ build_terminal_rows() {
     [ -s "$FACTS_FILE" ] || return
     while IFS=$'\t' read -r rank cat ns res owner detail ts; do
         [ -z "$rank" ] && continue
+        case "$ns" in   # platform namespaces are not the application team's
+            kube-system|kube-public|kube-node-lease)
+                case "$owner" in developer|developer-or-infra) owner="infra" ;; developer-or-network) owner="infra-or-network" ;; esac ;;
+        esac
         layer=$(fact_layer "$cat")
         sev=$(fact_severity "$cat" "$detail")
         case "$sev" in CRIT) sevn=0 ;; ERR) sevn=1 ;; *) sevn=2 ;; esac
@@ -2909,11 +3034,19 @@ function prio(i,   c) {
     return 1
 }
 function add(s, label, c) { return (s == "" ? "" : s "@@") "[" label "] " c }
-function fixtext(i,   cat, ns, res, p, c, ctrl, nf, s, rb, v, nv, code, q) {
+function fixtext(i,   cat, ns, res, p, c, ctrl, nf, s, rb, v, nv, code, q, jb) {
     cat = CT[i]; ns = NS[i]; res = RE[i]; split(res, q, "/"); p = q[1]; c = q[2]
     ctrl = (pk[i] != "") ? ctrlof(pk[i]) : ""
     nf = " -n " ns; s = ""
     rb = (pk[i] != "") ? rollback_target(pk[i]) : ""
+    if (p ~ /^helm-install-/ && ns == "kube-system" && (cat == "LOG_ERROR" || cat == "RESTART" || cat == "FAILED" || cat == "READINESS_FAIL")) {
+        jb = (ctrl ~ /^job\//) ? substr(ctrl, 5) : p
+        s = add(s, "inspect", "kubectl logs job/" jb " -n kube-system --tail=50")
+        s = add(s, "state", "kubectl get jobs,pods -n kube-system; kubectl get helmchart -A")
+        s = add(s, "note", "k3s runs these Helm jobs at start-up and retries them itself; if they end Complete and Traefik works, nothing needs fixing")
+        s = add(s, "only if it keeps failing once the node/network is stable", "kubectl delete job " jb " -n kube-system   (k3s recreates it)")
+        return s
+    }
     if (cat == "OOM" || cat == "POD_MEM_HIGH" || (cat == "RESTART" && ER[i] ~ /exitCode=137/)) {
         if (rb != "") { s = add(s, "check revisions", "kubectl rollout history " rb nf); s = add(s, "option A - quickest: roll back (a healthy older revision is running)", "kubectl rollout undo " rb nf) }
         v = contlimit(pk[i], c, plimmem[pk[i]]); nv = dbl(v)
@@ -3244,6 +3377,10 @@ print_terminal_summary() {
     echo " Notes: a trailing * on SINCE = start time unknown (scan time shown). Root causes are expected causes to verify, not proof."
     echo " Fix plan: commands are only SUGGESTIONS -- this tool is read-only and never runs them. They are given to the FIRST resource of each failure chain;"
     echo "           later resources say which # to fix instead. Chains are inferred from start times + relationships (same pod, Service backends, node, Deployment, errors that name another service) -- verify before acting."
+    [ "$tw" -lt 165 ] && echo " Tip: this terminal is $tw columns wide; widen it to 165+ (or set TERMINAL_WIDTH=200) for the full table layout."
+    if [ "${MASK_PII:-0}" != "1" ] && awk -F'\t' '$7 ~ /[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/ { f = 1 } END { exit !f }' "$TERM_ROWS_FILE" 2>/dev/null; then
+        echo " Privacy: a long number (possible national ID / card number) appears in this output. Re-run with MASK_PII=1 before sharing it outside the team (an ID you searched for stays visible)."
+    fi
     [ -n "$SEARCH_VALUE" ] && echo " With a search ID the table is ordered by SINCE (earliest failure first, all layers); ID=yes = the pod/service backend appears in the ID trail; * rows are point-in-time measurements or have an unknown start, so they sort last."
     echo ""
     echo "$LINE"
